@@ -1,102 +1,624 @@
-from scipy.spatial import distance as dist
-from imutils.video import VideoStream
-from imutils import face_utils
 from threading import Thread
 import numpy as np
 import playsound
 import argparse
-import imutils
 import time
-import dlib
 import cv2
+import os
+
+# ============================
+# MEDIAPIPE TASKS API (>= 0.10.21)
+# ============================
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
+
+# ============================
+# MEDIAPIPE LANDMARK INDICES (468-point Face Mesh)
+# ============================
+
+# Right eye (6 points for EAR)
+RIGHT_EYE = [33, 160, 158, 133, 153, 144]
+# Left eye (6 points for EAR)
+LEFT_EYE = [362, 385, 387, 263, 373, 380]
+
+# Eye contours for drawing
+RIGHT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+LEFT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+
+# Inner lips (for MAR calculation)
+INNER_LIP_MAR = {
+    "left_corner": 78,
+    "right_corner": 308,
+    "upper_left": 82,
+    "upper_center": 13,
+    "upper_right": 312,
+    "lower_left": 87,
+    "lower_center": 14,
+    "lower_right": 317,
+}
+
+# Lip contours for drawing
+INNER_LIP_CONTOUR = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+OUTER_LIP_CONTOUR = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
+
+# Head pose landmarks (6 key points for solvePnP)
+HEAD_POSE_LANDMARKS = {
+    "nose_tip": 1,
+    "chin": 152,
+    "left_eye_outer": 33,
+    "right_eye_outer": 263,
+    "left_mouth": 61,
+    "right_mouth": 291,
+}
+
+
+# ============================
+# UTILITY FUNCTIONS
+# ============================
+
+def euclidean(p1, p2):
+    """Compute euclidean distance between two points (replaces scipy)."""
+    return np.linalg.norm(np.array(p1, dtype=float) - np.array(p2, dtype=float))
 
 
 def sound_alarm(path):
-    # play an alarm sound
+    """Play an alarm sound."""
     playsound.playsound(path)
 
 
-def eye_aspect_ratio(eye):
-    A = dist.euclidean(eye[1], eye[5])
-    B = dist.euclidean(eye[2], eye[4])
-    C = dist.euclidean(eye[0], eye[3])
-    ear = (A + B) / (2.0 * C)
+def get_landmark_coords(landmarks, indices, frame_w, frame_h):
+    """Extract (x, y) pixel coordinates from MediaPipe normalized landmarks."""
+    coords = []
+    for idx in indices:
+        lm = landmarks[idx]
+        coords.append((int(lm.x * frame_w), int(lm.y * frame_h)))
+    return np.array(coords)
 
+
+def eye_aspect_ratio(eye_points):
+    """
+    Compute the Eye Aspect Ratio (EAR).
+    EAR = (||P2-P6|| + ||P3-P5||) / (2 * ||P1-P4||)
+    """
+    A = euclidean(eye_points[1], eye_points[5])
+    B = euclidean(eye_points[2], eye_points[4])
+    C = euclidean(eye_points[0], eye_points[3])
+    ear = (A + B) / (2.0 * C)
     return ear
 
 
+def mouth_aspect_ratio(landmarks, frame_w, frame_h):
+    """
+    Compute the Mouth Aspect Ratio (MAR) using inner lip landmarks.
+    MAR = (A + B + C) / (2 * D)
+    """
+    def pt(idx):
+        lm = landmarks[idx]
+        return np.array([lm.x * frame_w, lm.y * frame_h])
+
+    A = euclidean(pt(INNER_LIP_MAR["upper_left"]), pt(INNER_LIP_MAR["lower_left"]))
+    B = euclidean(pt(INNER_LIP_MAR["upper_center"]), pt(INNER_LIP_MAR["lower_center"]))
+    C = euclidean(pt(INNER_LIP_MAR["upper_right"]), pt(INNER_LIP_MAR["lower_right"]))
+    D = euclidean(pt(INNER_LIP_MAR["left_corner"]), pt(INNER_LIP_MAR["right_corner"]))
+
+    mar = (A + B + C) / (2.0 * D)
+    return mar
+
+
+def get_head_pose(landmarks, frame_w, frame_h):
+    """
+    Estimate head pose (pitch, yaw, roll) using cv2.solvePnP.
+    Uses 6 key MediaPipe landmarks mapped to a generic 3D face model.
+    """
+    image_points = np.array([
+        (landmarks[HEAD_POSE_LANDMARKS["nose_tip"]].x * frame_w,
+         landmarks[HEAD_POSE_LANDMARKS["nose_tip"]].y * frame_h),
+        (landmarks[HEAD_POSE_LANDMARKS["chin"]].x * frame_w,
+         landmarks[HEAD_POSE_LANDMARKS["chin"]].y * frame_h),
+        (landmarks[HEAD_POSE_LANDMARKS["left_eye_outer"]].x * frame_w,
+         landmarks[HEAD_POSE_LANDMARKS["left_eye_outer"]].y * frame_h),
+        (landmarks[HEAD_POSE_LANDMARKS["right_eye_outer"]].x * frame_w,
+         landmarks[HEAD_POSE_LANDMARKS["right_eye_outer"]].y * frame_h),
+        (landmarks[HEAD_POSE_LANDMARKS["left_mouth"]].x * frame_w,
+         landmarks[HEAD_POSE_LANDMARKS["left_mouth"]].y * frame_h),
+        (landmarks[HEAD_POSE_LANDMARKS["right_mouth"]].x * frame_w,
+         landmarks[HEAD_POSE_LANDMARKS["right_mouth"]].y * frame_h),
+    ], dtype="double")
+
+    model_points = np.array([
+        (0.0, 0.0, 0.0),
+        (0.0, -330.0, -65.0),
+        (-225.0, 170.0, -135.0),
+        (225.0, 170.0, -135.0),
+        (-150.0, -150.0, -125.0),
+        (150.0, -150.0, -125.0),
+    ])
+
+    focal_length = frame_w
+    center = (frame_w / 2, frame_h / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype="double")
+
+    dist_coeffs = np.zeros((4, 1))
+
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        model_points, image_points, camera_matrix, dist_coeffs,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+
+    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+    proj_matrix = np.hstack((rotation_matrix, translation_vector))
+    _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(proj_matrix)
+
+    pitch = euler_angles[0][0]
+    yaw = euler_angles[1][0]
+    roll = euler_angles[2][0]
+
+    nose_end_3D = np.array([(0.0, 0.0, 1000.0)])
+    nose_end_2D, _ = cv2.projectPoints(
+        nose_end_3D, rotation_vector, translation_vector,
+        camera_matrix, dist_coeffs
+    )
+
+    nose_tip_2d = (int(image_points[0][0]), int(image_points[0][1]))
+    return (pitch, yaw, roll), nose_end_2D, nose_tip_2d
+
+
+def draw_contour(frame, landmarks, indices, frame_w, frame_h, color, thickness=1):
+    """Draw a closed contour connecting the given landmark indices."""
+    points = get_landmark_coords(landmarks, indices, frame_w, frame_h)
+    cv2.polylines(frame, [points], isClosed=True, color=color, thickness=thickness)
+
+
+# ============================
+# ARGUMENT PARSING
+# ============================
+
 ap = argparse.ArgumentParser()
-ap.add_argument("-p", "--shape-predictor", required=True, help="Path to facial landmark predictor")
-ap.add_argument("-a", "--alarm", type=str, default="", help="path alarm .WAV file")
-ap.add_argument("-w", "--webcam", type=int, default=0, help="index of webcam on system")
+ap.add_argument("-a", "--alarm", type=str, default="",
+                help="Path to alarm .WAV file")
+ap.add_argument("-w", "--webcam", type=int, default=0,
+                help="Index of webcam on system")
 args = vars(ap.parse_args())
 
-EYE_AR_THRESH = 0.26
-EYE_AR_CONSEC_FRAMES = 48
 
-COUNTER = 0
+# ============================
+# THRESHOLDS & CONSTANTS
+# ============================
+
+EYE_AR_MILD_THRESH = 0.22
+EYE_AR_SEVERE_THRESH = 0.16
+EYE_CONSEC_FRAMES = 48
+EYE_SEVERE_CONSEC_FRAMES = 20
+
+MOUTH_AR_MILD_THRESH = 0.55
+MOUTH_AR_SEVERE_THRESH = 0.75
+MOUTH_CONSEC_FRAMES = 20
+MOUTH_SEVERE_CONSEC_FRAMES = 10
+
+HEAD_PITCH_MILD_THRESH = -15
+HEAD_PITCH_SEVERE_THRESH = -30
+HEAD_ROLL_MILD_THRESH = 20
+HEAD_ROLL_SEVERE_THRESH = 35
+HEAD_CONSEC_FRAMES = 30
+HEAD_SEVERE_CONSEC_FRAMES = 15
+
+NO_FACE_CONSEC_FRAMES = 50
+
+
+# ============================
+# STATE VARIABLES
+# ============================
+
+eye_mild_counter = 0
+mouth_mild_counter = 0
+head_pitch_mild_counter = 0
+head_roll_mild_counter = 0
+
+eye_severe_counter = 0
+mouth_severe_counter = 0
+head_pitch_severe_counter = 0
+head_roll_severe_counter = 0
+
+no_face_counter = 0
 ALARM_ON = False
 
-print("[INFO] Loading facial landmark predictor...")
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(args["shape_predictor"])
+eye_mild_alert = False
+eye_severe_alert = False
+mouth_mild_alert = False
+mouth_severe_alert = False
+head_pitch_mild_alert = False
+head_pitch_severe_alert = False
+head_roll_mild_alert = False
+head_roll_severe_alert = False
+no_face_alert = False
 
-(lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
-(rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+
+# ============================
+# DOWNLOAD MODEL IF NEEDED
+# ============================
+
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+
+if not os.path.exists(MODEL_PATH):
+    print("[INFO] Downloading face_landmarker model (~4MB)...")
+    import urllib.request
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("[INFO] Model downloaded to:", MODEL_PATH)
 
 
-print("[INFO] Starting video stream thread...")
-vs = VideoStream(src=args["webcam"]).start()
+# ============================
+# INITIALIZE MEDIAPIPE FACE LANDMARKER
+# ============================
+
+print("[INFO] Initializing MediaPipe Face Landmarker (Tasks API)...")
+
+base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+options = mp_vision.FaceLandmarkerOptions(
+    base_options=base_options,
+    running_mode=mp_vision.RunningMode.VIDEO,
+    output_face_blendshapes=False,
+    output_facial_transformation_matrixes=False,
+    num_faces=1,
+    min_face_detection_confidence=0.5,
+    min_face_presence_confidence=0.5,
+    min_tracking_confidence=0.5,
+)
+face_landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+
+
+# ============================
+# START VIDEO CAPTURE
+# ============================
+
+print("[INFO] Starting video stream...")
+cap = cv2.VideoCapture(args["webcam"])
 time.sleep(1.0)
 
-while True:
-    frame = vs.read()
-    frame = imutils.resize(frame, width=450)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+frame_timestamp_ms = 0
 
-    rects = detector(gray, 0)
 
-    for rect in rects:
-        shape = predictor(gray, rect)
-        shape = face_utils.shape_to_np(shape)
+# ============================
+# MAIN LOOP
+# ============================
 
-        leftEye = shape[lStart:lEnd]
-        rightEye = shape[rStart:rEnd]
-        leftEAR = eye_aspect_ratio(leftEye)
-        rightEAR = eye_aspect_ratio(rightEye)
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        print("[ERROR] Failed to read frame from webcam.")
+        break
 
-        ear = (leftEAR + rightEAR) / 2.0
+    frame_h, frame_w = frame.shape[:2]
 
-        leftEyeHull = cv2.convexHull(leftEye)
-        rightEyeHull = cv2.convexHull(rightEye)
-        cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
-        cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
+    # Convert BGR to RGB for MediaPipe
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    frame_timestamp_ms += 33  # ~30fps
 
-        if ear < EYE_AR_THRESH:
-            COUNTER += 1
+    results = face_landmarker.detect_for_video(mp_image, frame_timestamp_ms)
 
-            if COUNTER >= EYE_AR_CONSEC_FRAMES:
-                if not ALARM_ON:
-                    ALARM_ON = True
-                    if args["alarm"] != "":
-                        t = Thread(target=sound_alarm, args=(args["alarm"],))
-                        t.deamon = True
-                        t.start()
+    face_detected = len(results.face_landmarks) > 0
 
-                cv2.putText(frame, "DROWSINESS ALERT!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    # ============================
+    # NO FACE DETECTED
+    # ============================
+    if not face_detected:
+        no_face_counter += 1
+
+        eye_mild_alert = eye_severe_alert = False
+        mouth_mild_alert = mouth_severe_alert = False
+        head_pitch_mild_alert = head_pitch_severe_alert = False
+        head_roll_mild_alert = head_roll_severe_alert = False
+        eye_mild_counter = eye_severe_counter = 0
+        mouth_mild_counter = mouth_severe_counter = 0
+        head_pitch_mild_counter = head_pitch_severe_counter = 0
+        head_roll_mild_counter = head_roll_severe_counter = 0
+
+        if no_face_counter >= NO_FACE_CONSEC_FRAMES:
+            no_face_alert = True
+            if not ALARM_ON:
+                ALARM_ON = True
+                if args["alarm"] != "":
+                    t = Thread(target=sound_alarm, args=(args["alarm"],))
+                    t.daemon = True
+                    t.start()
+
+            cv2.putText(frame, "!! NO FACE DETECTED !!", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, "DROWSY!", (frame_w - 130, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
         else:
-            COUNTER = 0
+            no_face_alert = False
             ALARM_ON = False
 
-        cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, frame_h - 50), (280, frame_h), (40, 40, 40), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.putText(frame, "No face: {} / {}".format(no_face_counter, NO_FACE_CONSEC_FRAMES),
+                    (10, frame_h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
 
-    cv2.imshow("Frame", frame)
+        cv2.imshow("Drowsiness Detection (MediaPipe)", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        continue
+
+    # Face found -> reset
+    no_face_counter = 0
+    no_face_alert = False
+
+    for face_lm in results.face_landmarks:
+        landmarks = face_lm  # list of NormalizedLandmark
+
+        # ------ EYE ASPECT RATIO ------
+        left_eye_pts = get_landmark_coords(landmarks, LEFT_EYE, frame_w, frame_h)
+        right_eye_pts = get_landmark_coords(landmarks, RIGHT_EYE, frame_w, frame_h)
+        leftEAR = eye_aspect_ratio(left_eye_pts)
+        rightEAR = eye_aspect_ratio(right_eye_pts)
+        ear = (leftEAR + rightEAR) / 2.0
+
+        draw_contour(frame, landmarks, LEFT_EYE_CONTOUR, frame_w, frame_h, (0, 255, 0), 1)
+        draw_contour(frame, landmarks, RIGHT_EYE_CONTOUR, frame_w, frame_h, (0, 255, 0), 1)
+
+        # ------ MOUTH ASPECT RATIO ------
+        mar = mouth_aspect_ratio(landmarks, frame_w, frame_h)
+
+        draw_contour(frame, landmarks, OUTER_LIP_CONTOUR, frame_w, frame_h, (180, 0, 180), 1)
+        draw_contour(frame, landmarks, INNER_LIP_CONTOUR, frame_w, frame_h, (255, 0, 255), 1)
+
+        # ------ HEAD POSE ------
+        (pitch, yaw, roll), nose_end_2D, nose_tip = get_head_pose(landmarks, frame_w, frame_h)
+
+        p2 = (int(nose_end_2D[0][0][0]), int(nose_end_2D[0][0][1]))
+        cv2.line(frame, nose_tip, p2, (255, 0, 0), 2)
+
+        for key_name, idx in HEAD_POSE_LANDMARKS.items():
+            lm = landmarks[idx]
+            px = int(lm.x * frame_w)
+            py = int(lm.y * frame_h)
+            cv2.circle(frame, (px, py), 3, (0, 0, 255), -1)
+
+        # ============================
+        # UPDATE COUNTERS & ALERTS
+        # ============================
+
+        # --- Eyes ---
+        if ear < EYE_AR_SEVERE_THRESH:
+            eye_severe_counter += 1
+            eye_mild_counter += 1
+        elif ear < EYE_AR_MILD_THRESH:
+            eye_mild_counter += 1
+            eye_severe_counter = 0
+        else:
+            eye_mild_counter = 0
+            eye_severe_counter = 0
+
+        eye_severe_alert = (eye_severe_counter >= EYE_SEVERE_CONSEC_FRAMES)
+        eye_mild_alert = (eye_mild_counter >= EYE_CONSEC_FRAMES)
+
+        # --- Mouth ---
+        if mar > MOUTH_AR_SEVERE_THRESH:
+            mouth_severe_counter += 1
+            mouth_mild_counter += 1
+        elif mar > MOUTH_AR_MILD_THRESH:
+            mouth_mild_counter += 1
+            mouth_severe_counter = 0
+        else:
+            mouth_mild_counter = 0
+            mouth_severe_counter = 0
+
+        mouth_severe_alert = (mouth_severe_counter >= MOUTH_SEVERE_CONSEC_FRAMES)
+        mouth_mild_alert = (mouth_mild_counter >= MOUTH_CONSEC_FRAMES)
+
+        # --- Head pitch ---
+        if pitch < HEAD_PITCH_SEVERE_THRESH:
+            head_pitch_severe_counter += 1
+            head_pitch_mild_counter += 1
+        elif pitch < HEAD_PITCH_MILD_THRESH:
+            head_pitch_mild_counter += 1
+            head_pitch_severe_counter = 0
+        else:
+            head_pitch_mild_counter = 0
+            head_pitch_severe_counter = 0
+
+        head_pitch_severe_alert = (head_pitch_severe_counter >= HEAD_SEVERE_CONSEC_FRAMES)
+        head_pitch_mild_alert = (head_pitch_mild_counter >= HEAD_CONSEC_FRAMES)
+
+        # --- Head roll ---
+        abs_roll = abs(roll)
+        if abs_roll > HEAD_ROLL_SEVERE_THRESH:
+            head_roll_severe_counter += 1
+            head_roll_mild_counter += 1
+        elif abs_roll > HEAD_ROLL_MILD_THRESH:
+            head_roll_mild_counter += 1
+            head_roll_severe_counter = 0
+        else:
+            head_roll_mild_counter = 0
+            head_roll_severe_counter = 0
+
+        head_roll_severe_alert = (head_roll_severe_counter >= HEAD_SEVERE_CONSEC_FRAMES)
+        head_roll_mild_alert = (head_roll_mild_counter >= HEAD_CONSEC_FRAMES)
+
+        # ============================
+        # ALARM DECISION LOGIC
+        # ============================
+        # EYES = primary indicator (gate)
+        # 1. ANY severe -> AUTO alarm
+        # 2. Eyes mild alone -> alarm
+        # 3. Eyes mild + any other mild -> alarm
+        # 4. Other mild WITHOUT eyes -> CAUTION only
+        # 5. No face -> auto alarm (above)
+
+        any_severe = (eye_severe_alert or mouth_severe_alert or
+                      head_pitch_severe_alert or head_roll_severe_alert)
+
+        other_mild_count = sum([
+            mouth_mild_alert,
+            head_pitch_mild_alert,
+            head_roll_mild_alert
+        ])
+
+        mild_count = other_mild_count + (1 if eye_mild_alert else 0)
+
+        combined_mild = eye_mild_alert and (other_mild_count >= 1)
+        eyes_only_mild = eye_mild_alert and (other_mild_count == 0)
+
+        should_alarm = any_severe or combined_mild or eyes_only_mild
+
+        if should_alarm:
+            if not ALARM_ON:
+                ALARM_ON = True
+                if args["alarm"] != "":
+                    t = Thread(target=sound_alarm, args=(args["alarm"],))
+                    t.daemon = True
+                    t.start()
+        else:
+            ALARM_ON = False
+
+        # ============================
+        # DRAW ALERTS
+        # ============================
+        alert_y = 30
+
+        if any_severe:
+            cv2.putText(frame, "!! CRITICAL DROWSINESS !!", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            alert_y += 28
+
+        if eye_severe_alert:
+            cv2.putText(frame, "[SEVERE] EYES SHUT", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            alert_y += 25
+        elif eye_mild_alert:
+            cv2.putText(frame, "[MILD] Eyes Drooping", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            alert_y += 25
+
+        if mouth_severe_alert:
+            cv2.putText(frame, "[SEVERE] WIDE YAWN", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            alert_y += 25
+        elif mouth_mild_alert:
+            cv2.putText(frame, "[MILD] Yawning", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            alert_y += 25
+
+        if head_pitch_severe_alert:
+            cv2.putText(frame, "[SEVERE] HEAD SLUMPED", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            alert_y += 25
+        elif head_pitch_mild_alert:
+            cv2.putText(frame, "[MILD] Head Nodding", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            alert_y += 25
+
+        if head_roll_severe_alert:
+            cv2.putText(frame, "[SEVERE] HEAD TILTED", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            alert_y += 25
+        elif head_roll_mild_alert:
+            cv2.putText(frame, "[MILD] Head Tilting", (10, alert_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            alert_y += 25
+
+        # ============================
+        # TELEMETRY (bottom-left)
+        # ============================
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, frame_h - 150), (320, frame_h), (40, 40, 40), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+        info_y = frame_h - 130
+
+        def get_color(val, mild_t, severe_t, lower_is_bad=True):
+            if lower_is_bad:
+                if val < severe_t:
+                    return (0, 0, 255)
+                elif val < mild_t:
+                    return (0, 165, 255)
+                else:
+                    return (0, 255, 0)
+            else:
+                if val > severe_t:
+                    return (0, 0, 255)
+                elif val > mild_t:
+                    return (0, 165, 255)
+                else:
+                    return (0, 255, 0)
+
+        ear_c = get_color(ear, EYE_AR_MILD_THRESH, EYE_AR_SEVERE_THRESH, True)
+        mar_c = get_color(mar, MOUTH_AR_MILD_THRESH, MOUTH_AR_SEVERE_THRESH, False)
+        pitch_c = get_color(pitch, HEAD_PITCH_MILD_THRESH, HEAD_PITCH_SEVERE_THRESH, True)
+        roll_c = get_color(abs_roll, HEAD_ROLL_MILD_THRESH, HEAD_ROLL_SEVERE_THRESH, False)
+
+        cv2.putText(frame, "EAR:   {:.2f}  (mild:{:.2f} sev:{:.2f})".format(
+            ear, EYE_AR_MILD_THRESH, EYE_AR_SEVERE_THRESH),
+            (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ear_c, 1)
+
+        cv2.putText(frame, "MAR:   {:.2f}  (mild:{:.2f} sev:{:.2f})".format(
+            mar, MOUTH_AR_MILD_THRESH, MOUTH_AR_SEVERE_THRESH),
+            (10, info_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mar_c, 1)
+
+        cv2.putText(frame, "Pitch: {:.1f}  (mild:{:.0f} sev:{:.0f})".format(
+            pitch, HEAD_PITCH_MILD_THRESH, HEAD_PITCH_SEVERE_THRESH),
+            (10, info_y + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45, pitch_c, 1)
+
+        cv2.putText(frame, "Roll:  {:.1f}  (mild:+/-{:.0f} sev:+/-{:.0f})".format(
+            roll, HEAD_ROLL_MILD_THRESH, HEAD_ROLL_SEVERE_THRESH),
+            (10, info_y + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.45, roll_c, 1)
+
+        # Combined logic info
+        if eye_mild_alert:
+            combo_text = "Eyes + {} other sign(s)".format(other_mild_count)
+            combo_color = (0, 0, 255) if combined_mild else (0, 165, 255)
+        elif other_mild_count > 0:
+            combo_text = "Other signs: {} (eyes OK, no alarm)".format(other_mild_count)
+            combo_color = (0, 165, 255)
+        else:
+            combo_text = "All signs normal"
+            combo_color = (0, 255, 0)
+
+        cv2.putText(frame, combo_text,
+                    (10, info_y + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.45, combo_color, 1)
+
+        cv2.putText(frame, "No-face: {} / {}".format(no_face_counter, NO_FACE_CONSEC_FRAMES),
+                    (10, info_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+        # ============================
+        # STATUS (top-right)
+        # ============================
+        if should_alarm:
+            status_text = "DROWSY!"
+            status_color = (0, 0, 255)
+        elif mild_count >= 1:
+            status_text = "CAUTION"
+            status_color = (0, 165, 255)
+        else:
+            status_text = "AWAKE"
+            status_color = (0, 255, 0)
+
+        (tw, th), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+        cv2.putText(frame, status_text, (frame_w - tw - 15, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
+
+        # Technology label
+        cv2.putText(frame, "MediaPipe + OpenCV + EAR + MAR", (frame_w - 310, frame_h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+    # Show frame
+    cv2.imshow("Drowsiness Detection (MediaPipe)", frame)
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord('q'):
         break
 
+# Cleanup
+face_landmarker.close()
+cap.release()
 cv2.destroyAllWindows()
-vs.stop()
-
-

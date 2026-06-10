@@ -1,64 +1,78 @@
-# DROWSINESS DETECTION WITH OPENCV
-### Detects and Alerts if the driver is starting to doze off.
+# DROWSINESS DETECTION WITH MEDIAPIPE & OPENCV
 
-Very simple and effective blink detector using just Python, OpenCV and dlib.
+Hệ thống cảnh báo buồn ngủ sử dụng **MediaPipe Face Landmarker** và **OpenCV** để phân tích khuôn mặt theo thời gian thực. Hệ thống theo dõi đồng thời 4 yếu tố để đưa ra cảnh báo chính xác:
 
-All thanks to Adrian Rosebrock (from [pyimagesearch](https://www.pyimagesearch.com/)) for making
-great tutorials. This project is inspired from his blog: [Drowsiness detection with OpenCV](https://www.pyimagesearch.com/2017/05/08/drowsiness-detection-opencv/).
-I have included the author's code and the one I wrote my self as well.
+1. **EAR (Eye Aspect Ratio):** Nhắm mắt (Mắt là yếu tố chính - Primary Gate)
+2. **MAR (Mouth Aspect Ratio):** Ngáp
+3. **Head Pitch (Cúi đầu):** Ngủ gật gục đầu
+4. **Head Roll (Nghiêng đầu):** Đầu nghiêng lệch sang hai bên
+5. **Mất dấu khuôn mặt (No Face):** Quay mặt đi hướng khác quá lâu
 
-## **Key Points**
-1. Steps involved:
-    1. Localize the face in the video frame
-    2. Detect the key facial structures on the face ROI
-    3. Extract out the eyes landmarks.
-    4. Calculate EAR (eye aspect ratio)
-    5. Threshold the EAR to determine if it is below certain threshold and increment the counter.
-    6. If the person's EAR is below threshold for more than certain number of frames, alert the driver
-    by playing the sound.
-2. Assumptions:
-    1. We already have the trained face detector and face landmark detector.
-    2. There is only one face in the frame
-3. **EAR** (Eye Aspect Ratio) formula is as follows:
-![EAR FORMULA](assets/blink_detection_equation.png)
+---
 
-4. The eye aspect ratio will be large and remain approximately constant when the eyes are open.
- It will rapidly approach zero when the driver closes his/her eyes. If it remains low for long enough time
- we can say that the driver has closed his/her eyes. 
-5. The dlib's face detector is an implementation of **One Millisecond Face Alignment with an Ensemble of Regression Trees** paper by Kazemi and Sullivan (2014).
-6. 68 coordinates are detected for the given face by the face detector as shown below:
-![FACIAL LANDMARKS MARKUP](assets/facial_landmarks_68markup-768x619.jpg)
-7. dlib's framework can be trained to predict any shape. Hence it can be used for custom shape detections as well.
-8. Used dlib's pre-trained face detector based on the modification of the standard **Histogram of Oriented Gradients + Linear SVM method** for object detection.
-9. Used opencv's convexHull function to determine the contour for the detected eye landmarks
-10. This method uses just the eye aspect ratio as the metric to determine if the driver's eyes are closed or open.
-11. We use **playsound** library to play sound in python. We also use seperate thread for playing sound
-so that our main thread doesn't block and our script keeps on working and the sound will play in the background.
-12. Two important techniques used in this project:
-    1. Facial Landmark Detection
-    2. Eye Aspect Ratio
+## **Các tính năng nổi bật**
+- **Không cần dlib:** Loại bỏ dlib nặng nề, không cần cài đặt C++ Build Tools hay CMake phức tạp.
+- **Không cần file model cục bộ nặng:** MediaPipe tự động tải mô hình siêu nhẹ (`face_landmarker.task` ~4MB) trong lần chạy đầu tiên.
+- **Theo dõi 468 điểm (Face Mesh):** Độ chính xác cao hơn rất nhiều so với 68 điểm của dlib.
+- **Cảnh báo đa cấp độ (Mild / Severe):**
+  - **Mức độ nghiêm trọng (Severe):** Mắt nhắm tịt, ngáp rất to, cúi gập đầu -> Kêu ngay lập tức.
+  - **Mức độ nhẹ (Mild):** Mắt lờ đờ + (kèm theo ngáp hoặc cúi đầu nhẹ) -> Kết hợp lại sẽ kêu. Nếu chỉ ngáp/cúi đầu nhẹ mà mắt vẫn mở to thì chỉ hiện cảnh báo "CAUTION" trên màn hình chứ không kêu ồn ào.
 
- ## **Requirements: (with versions I tested on)**
- 1. python          (3.7.3)
- 2. opencv          (4.1.0)
- 3. numpy           (1.61.4)
- 4. imutils         (0.5.2)
- 5. dlib            (19.17.0)
+---
 
- ## **Commands to run the detection:**
- ```
- python detect_drowsiness.py \
-	--shape-predictor shape_predictor_68_face_landmarks.dat \
-	--alarm alarm.wav
+## **Hướng dẫn cài đặt từ đầu (Cho máy tính hoàn toàn mới)**
+
+Nếu bạn mang source code này sang một máy tính chưa từng cài đặt gì, hãy làm theo các bước sau:
+
+### **Bước 1: Cài đặt Python**
+1. Tải và cài đặt **Python** (phiên bản từ 3.8 đến 3.11 là tốt nhất) từ trang chủ: https://www.python.org/downloads/
+2. **QUAN TRỌNG:** Trong quá trình cài đặt Python, nhớ tích vào ô **"Add Python to PATH"** (hoặc "Add python.exe to PATH") ở màn hình đầu tiên.
+
+### **Bước 2: Tạo môi trường ảo (Virtual Environment - Khuyên dùng)**
+Môi trường ảo giúp các thư viện của dự án này không bị xung đột với các dự án khác trên máy.
+1. Mở Terminal (hoặc PowerShell, Command Prompt) tại thư mục chứa code (thư mục `Drowsiness-detection-with-OpenCV`).
+2. Chạy lệnh tạo môi trường ảo (tên là `venv`):
+   ```powershell
+   python -m venv venv
+   ```
+3. Kích hoạt môi trường ảo:
+   - Trên **Windows**:
+     ```powershell
+     .\venv\Scripts\activate
+     ```
+   - Trên **Mac/Linux**:
+     ```bash
+     source venv/bin/activate
+     ```
+   *(Sau khi kích hoạt, bạn sẽ thấy chữ `(venv)` hiện ở đầu dòng lệnh).*
+
+### **Bước 3: Cài đặt thư viện**
+Khi môi trường ảo đã được kích hoạt, bạn tiến hành cài các thư viện cần thiết bằng lệnh sau:
+```powershell
+pip install mediapipe>=0.10.21 opencv-python>=4.7.0 numpy>=1.21.0 playsound==1.2.2
+```
+*(Lưu ý: Chúng tôi sử dụng `playsound==1.2.2` vì phiên bản 1.3.0 trên Windows đôi khi gây lỗi).*
+
+---
+
+## **Cách chạy chương trình**
+
+Đảm bảo bạn vẫn đang ở trong môi trường ảo `(venv)`, chạy lệnh sau:
+
+```powershell
+python detect_drowsiness_mine.py --alarm alarm.wav
 ```
 
-## **Results:**
-The results are pretty accurate. We can see that it accurately and reliably detects if the driver
-starts to fall asleep. It works pretty well in real time and doesn't need very superior hardware.
+**Thao tác trong lúc chạy:**
+- Lần đầu chạy, hệ thống sẽ mất vài giây để tải file `face_landmarker.task` (~4MB) từ Google. Các lần sau sẽ chạy ngay lập tức mà không cần mạng.
+- Để **thoát chương trình**, hãy click chuột vào cửa sổ camera (chỗ đang quay video) và nhấn phím **`q`** trên bàn phím.
 
-![Example output](assets/output.gif)
+---
 
-
-
-## **Limitations**
-None
+## **Giao diện & Cảnh báo**
+- Dưới cùng góc trái sẽ hiển thị các chỉ số **EAR, MAR, Pitch, Roll** theo thời gian thực (Xanh = Bình thường, Cam = Nhẹ, Đỏ = Nghiêm trọng).
+- Trên cùng bên phải sẽ báo trạng thái **AWAKE** (Tỉnh táo), **CAUTION** (Chú ý), hoặc **DROWSY!** (Buồn ngủ).
+- Hình vẽ trên mặt:
+  - Mắt: Xanh lá cây
+  - Miệng: Tím
+  - Trục mũi (Đường thẳng màu xanh dương): Thể hiện hướng xoay của đầu (3D Pose).

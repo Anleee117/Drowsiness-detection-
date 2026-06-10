@@ -1,0 +1,4 @@
+opencv-python>=4.7.0
+mediapipe>=0.10.21
+playsound==1.2.2
+numpy>=1.21.0

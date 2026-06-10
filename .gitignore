@@ -1,0 +1,23 @@
+# Environments
+venv/
+env/
+.env
+
+# Cache
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
+
+# Large models and data files
+shape_predictor_68_face_landmarks.dat
+face_landmarker.task
+*.dat
+*.tflite
+*.task
+
+# OS generated files
+.DS_Store
+Thumbs.db
