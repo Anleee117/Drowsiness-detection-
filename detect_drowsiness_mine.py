@@ -191,22 +191,45 @@ args = vars(ap.parse_args())
 # THRESHOLDS & CONSTANTS
 # ============================
 
-EYE_AR_MILD_THRESH = 0.22
-EYE_AR_SEVERE_THRESH = 0.16
-EYE_CONSEC_FRAMES = 48
-EYE_SEVERE_CONSEC_FRAMES = 20
+# --- Eyes (EAR) ---
+# Blink vs Microsleep discrimination:
+#   - Normal blink: EAR < 0.16 for only 3-12 frames (~0.1-0.4s at 30fps) -> NO alarm
+#   - Microsleep:   EAR < 0.16 for >= 20 consecutive frames (~0.67s)       -> ALARM
+#   - Counter resets to 0 IMMEDIATELY when EAR >= threshold (eye opens)
+#   - This eliminates false alarms from normal blinking.
+EYE_AR_SEVERE_THRESH = 0.16          # Below this = eyes closed (blink or microsleep)
+EYE_AR_MILD_THRESH   = 0.22          # Below this = eyes drooping (kept for mild warning)
+EYE_SEVERE_CONSEC_FRAMES = 20        # ~0.67s at 30fps  -> microsleep confirmed
+EYE_CONSEC_FRAMES        = 48        # ~1.6s at 30fps   -> persistent drooping
 
+# --- Mouth (MAR) ---
 MOUTH_AR_MILD_THRESH = 0.55
 MOUTH_AR_SEVERE_THRESH = 0.75
 MOUTH_CONSEC_FRAMES = 20
 MOUTH_SEVERE_CONSEC_FRAMES = 10
 
-HEAD_PITCH_MILD_THRESH = -15
-HEAD_PITCH_SEVERE_THRESH = -30
-HEAD_ROLL_MILD_THRESH = 20
+# --- Head Pitch (chin-to-chest angle) ---
+# Research-based zones (positive = looking down, negative depends on solvePnP convention):
+#   0° – 15° down : SAFE      – normal glance at dashboard
+#   15° – 20° down: DISTRACTED – looking at phone/screen
+#   > 20° down    : DANGER    – neck muscle loss, characteristic of microsleep
+#
+# Alarm rule: pitch must stay in DANGER zone for 2-3 seconds continuously
+#             (~60-90 frames at 30fps) before triggering, to avoid false alarms
+#             from momentarily dropping something and looking down to pick it up.
+#
+# Note: cv2.decomposeProjectionMatrix pitch sign: negative = head down in this setup
+HEAD_PITCH_SAFE_THRESH     = -15     # 0° to 15° down  -> safe zone
+HEAD_PITCH_DISTRACT_THRESH = -20     # 15° to 20° down -> distracted zone
+HEAD_PITCH_DANGER_THRESH   = -20     # alias for clarity: > 20° down = danger
+HEAD_PITCH_MILD_THRESH     = -15     # kept for backward-compat (safe boundary)
+HEAD_PITCH_SEVERE_THRESH   = -20     # severe = danger zone (> 20° head-down)
+HEAD_CONSEC_FRAMES         = 30      # ~1.0s  -> persistent mild pitch
+HEAD_SEVERE_CONSEC_FRAMES  = 75      # ~2.5s  -> danger pitch confirmed (2-3s rule)
+
+# --- Head Roll ---
+HEAD_ROLL_MILD_THRESH  = 20
 HEAD_ROLL_SEVERE_THRESH = 35
-HEAD_CONSEC_FRAMES = 30
-HEAD_SEVERE_CONSEC_FRAMES = 15
 
 NO_FACE_CONSEC_FRAMES = 50
 
@@ -215,28 +238,30 @@ NO_FACE_CONSEC_FRAMES = 50
 # STATE VARIABLES
 # ============================
 
-eye_mild_counter = 0
-mouth_mild_counter = 0
-head_pitch_mild_counter = 0
-head_roll_mild_counter = 0
+# Eye counters – strict reset on eye-open (blink vs microsleep discrimination)
+eye_severe_counter = 0   # frames where EAR < EYE_AR_SEVERE_THRESH (potential microsleep)
+eye_mild_counter   = 0   # frames where EAR < EYE_AR_MILD_THRESH   (drooping)
 
-eye_severe_counter = 0
+mouth_mild_counter   = 0
 mouth_severe_counter = 0
-head_pitch_severe_counter = 0
-head_roll_severe_counter = 0
+
+head_pitch_mild_counter   = 0
+head_pitch_severe_counter = 0  # frames in DANGER zone (>20° head-down)
+head_roll_mild_counter    = 0
+head_roll_severe_counter  = 0
 
 no_face_counter = 0
 ALARM_ON = False
 
-eye_mild_alert = False
-eye_severe_alert = False
-mouth_mild_alert = False
-mouth_severe_alert = False
-head_pitch_mild_alert = False
-head_pitch_severe_alert = False
-head_roll_mild_alert = False
+eye_mild_alert         = False
+eye_severe_alert       = False   # True = microsleep detected
+mouth_mild_alert       = False
+mouth_severe_alert     = False
+head_pitch_mild_alert  = False
+head_pitch_severe_alert = False  # True = prolonged head-down (2-3s)
+head_roll_mild_alert   = False
 head_roll_severe_alert = False
-no_face_alert = False
+no_face_alert          = False
 
 
 # ============================
@@ -388,19 +413,26 @@ while cap.isOpened():
         # UPDATE COUNTERS & ALERTS
         # ============================
 
-        # --- Eyes ---
+        # --- Eyes (Blink vs Microsleep discrimination) ---
+        # KEY LOGIC: Counter resets to 0 IMMEDIATELY when eye opens (EAR >= threshold).
+        # This suppresses false alarms from normal blinks (3-12 frames, <0.4s).
+        # Only sustained closure >= 20 frames (~0.67s) triggers microsleep alert.
         if ear < EYE_AR_SEVERE_THRESH:
+            # Eyes fully closed -> increment both counters (could still be a blink)
             eye_severe_counter += 1
             eye_mild_counter += 1
         elif ear < EYE_AR_MILD_THRESH:
+            # Eyes drooping (half-open) -> mild only, reset severe immediately
             eye_mild_counter += 1
-            eye_severe_counter = 0
+            eye_severe_counter = 0   # <-- IMMEDIATE reset: not a microsleep
         else:
+            # Eyes open -> reset BOTH counters immediately
             eye_mild_counter = 0
-            eye_severe_counter = 0
+            eye_severe_counter = 0   # <-- IMMEDIATE reset: suppresses blink false alarms
 
+        # Microsleep = eyes shut for >= EYE_SEVERE_CONSEC_FRAMES consecutively
         eye_severe_alert = (eye_severe_counter >= EYE_SEVERE_CONSEC_FRAMES)
-        eye_mild_alert = (eye_mild_counter >= EYE_CONSEC_FRAMES)
+        eye_mild_alert   = (eye_mild_counter   >= EYE_CONSEC_FRAMES)
 
         # --- Mouth ---
         if mar > MOUTH_AR_SEVERE_THRESH:
@@ -414,21 +446,29 @@ while cap.isOpened():
             mouth_severe_counter = 0
 
         mouth_severe_alert = (mouth_severe_counter >= MOUTH_SEVERE_CONSEC_FRAMES)
-        mouth_mild_alert = (mouth_mild_counter >= MOUTH_CONSEC_FRAMES)
+        mouth_mild_alert   = (mouth_mild_counter   >= MOUTH_CONSEC_FRAMES)
 
-        # --- Head pitch ---
-        if pitch < HEAD_PITCH_SEVERE_THRESH:
+        # --- Head Pitch (chin-to-chest / head nodding) ---
+        # Zone classification (negative pitch = head bowing down in solvePnP convention):
+        #   pitch > -15°            -> SAFE zone        (normal driving glance)
+        #   -20° < pitch <= -15°    -> DISTRACTED zone  (phone / infotainment)
+        #   pitch <= -20°           -> DANGER zone      (microsleep posture)
+        #
+        # Alarm: DANGER zone must persist 2-3 seconds (~75 frames) to avoid
+        # false positives from momentarily dropping something and looking down.
+        if pitch < HEAD_PITCH_SEVERE_THRESH:      # <=> pitch <= -20° -> DANGER
             head_pitch_severe_counter += 1
             head_pitch_mild_counter += 1
-        elif pitch < HEAD_PITCH_MILD_THRESH:
+        elif pitch < HEAD_PITCH_MILD_THRESH:      # <=> -20° < pitch <= -15° -> DISTRACTED
             head_pitch_mild_counter += 1
-            head_pitch_severe_counter = 0
-        else:
+            head_pitch_severe_counter = 0         # left DANGER zone -> reset danger counter
+        else:                                     # > -15° -> SAFE -> reset all
             head_pitch_mild_counter = 0
             head_pitch_severe_counter = 0
 
+        # Severe pitch alert requires ~2.5s of continuous DANGER zone (HEAD_SEVERE_CONSEC_FRAMES=75)
         head_pitch_severe_alert = (head_pitch_severe_counter >= HEAD_SEVERE_CONSEC_FRAMES)
-        head_pitch_mild_alert = (head_pitch_mild_counter >= HEAD_CONSEC_FRAMES)
+        head_pitch_mild_alert   = (head_pitch_mild_counter   >= HEAD_CONSEC_FRAMES)
 
         # --- Head roll ---
         abs_roll = abs(roll)
@@ -443,7 +483,7 @@ while cap.isOpened():
             head_roll_severe_counter = 0
 
         head_roll_severe_alert = (head_roll_severe_counter >= HEAD_SEVERE_CONSEC_FRAMES)
-        head_roll_mild_alert = (head_roll_mild_counter >= HEAD_CONSEC_FRAMES)
+        head_roll_mild_alert   = (head_roll_mild_counter   >= HEAD_CONSEC_FRAMES)
 
         # ============================
         # ALARM DECISION LOGIC
@@ -492,8 +532,8 @@ while cap.isOpened():
             alert_y += 28
 
         if eye_severe_alert:
-            cv2.putText(frame, "[SEVERE] EYES SHUT", (10, alert_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(frame, "[MICROSLEEP] EYES SHUT >{:.0f}f".format(EYE_SEVERE_CONSEC_FRAMES),
+                        (10, alert_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             alert_y += 25
         elif eye_mild_alert:
             cv2.putText(frame, "[MILD] Eyes Drooping", (10, alert_y),
@@ -510,11 +550,13 @@ while cap.isOpened():
             alert_y += 25
 
         if head_pitch_severe_alert:
-            cv2.putText(frame, "[SEVERE] HEAD SLUMPED", (10, alert_y),
+            # DANGER zone (>20° head-down) held for 2-3s -> microsleep posture
+            cv2.putText(frame, "[DANGER] HEAD SLUMPED (>20deg ~2-3s)", (10, alert_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             alert_y += 25
         elif head_pitch_mild_alert:
-            cv2.putText(frame, "[MILD] Head Nodding", (10, alert_y),
+            # DISTRACTED zone (15-20° head-down) held for ~1s
+            cv2.putText(frame, "[DISTRACTED] Head Nodding (15-20deg)", (10, alert_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
             alert_y += 25
 
@@ -557,16 +599,23 @@ while cap.isOpened():
         pitch_c = get_color(pitch, HEAD_PITCH_MILD_THRESH, HEAD_PITCH_SEVERE_THRESH, True)
         roll_c = get_color(abs_roll, HEAD_ROLL_MILD_THRESH, HEAD_ROLL_SEVERE_THRESH, False)
 
-        cv2.putText(frame, "EAR:   {:.2f}  (mild:{:.2f} sev:{:.2f})".format(
-            ear, EYE_AR_MILD_THRESH, EYE_AR_SEVERE_THRESH),
+        cv2.putText(frame, "EAR:   {:.2f}  (blink<{:.2f} / microsleep>={:.0f}f)".format(
+            ear, EYE_AR_SEVERE_THRESH, EYE_SEVERE_CONSEC_FRAMES),
             (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ear_c, 1)
 
-        cv2.putText(frame, "MAR:   {:.2f}  (mild:{:.2f} sev:{:.2f})".format(
-            mar, MOUTH_AR_MILD_THRESH, MOUTH_AR_SEVERE_THRESH),
+        cv2.putText(frame, "EAR cnt: {:3d}/{:d}  MAR: {:.2f} (>{:.2f})".format(
+            eye_severe_counter, EYE_SEVERE_CONSEC_FRAMES, mar, MOUTH_AR_MILD_THRESH),
             (10, info_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mar_c, 1)
 
-        cv2.putText(frame, "Pitch: {:.1f}  (mild:{:.0f} sev:{:.0f})".format(
-            pitch, HEAD_PITCH_MILD_THRESH, HEAD_PITCH_SEVERE_THRESH),
+        # Pitch zone label
+        if pitch > HEAD_PITCH_MILD_THRESH:
+            pitch_zone = "SAFE"
+        elif pitch > HEAD_PITCH_SEVERE_THRESH:
+            pitch_zone = "DISTRACTED"
+        else:
+            pitch_zone = "DANGER"
+        cv2.putText(frame, "Pitch: {:.1f} [{:s}] cnt:{:d}/{:d}".format(
+            pitch, pitch_zone, head_pitch_severe_counter, HEAD_SEVERE_CONSEC_FRAMES),
             (10, info_y + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45, pitch_c, 1)
 
         cv2.putText(frame, "Roll:  {:.1f}  (mild:+/-{:.0f} sev:+/-{:.0f})".format(
