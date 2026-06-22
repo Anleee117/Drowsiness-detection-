@@ -64,8 +64,14 @@ def euclidean(p1, p2):
 
 
 def sound_alarm(path):
-    """Play an alarm sound."""
-    playsound.playsound(path)
+    """Play an alarm sound repeatedly while ALARM_ON is True."""
+    global ALARM_ON
+    while ALARM_ON:
+        try:
+            playsound.playsound(path)
+        except Exception as e:
+            print("[ERROR] Playsound error:", e)
+            break
 
 
 def get_landmark_coords(landmarks, indices, frame_w, frame_h):
@@ -159,6 +165,15 @@ def get_head_pose(landmarks, frame_w, frame_h):
     yaw = euler_angles[1][0]
     roll = euler_angles[2][0]
 
+    # Normalize pitch to be around 0 when looking straight (range -90 to 90)
+    if pitch > 90:
+        pitch = pitch - 180
+    elif pitch < -90:
+        pitch = pitch + 180
+        
+    # Invert pitch sign so that looking down is positive (0 to 90)
+    pitch = -pitch
+
     nose_end_3D = np.array([(0.0, 0.0, 1000.0)])
     nose_end_2D, _ = cv2.projectPoints(
         nose_end_3D, rotation_vector, translation_vector,
@@ -193,20 +208,20 @@ args = vars(ap.parse_args())
 
 # --- Eyes (EAR) ---
 # Blink vs Microsleep discrimination:
-#   - Normal blink: EAR < 0.16 for only 3-12 frames (~0.1-0.4s at 30fps) -> NO alarm
-#   - Microsleep:   EAR < 0.16 for >= 20 consecutive frames (~0.67s)       -> ALARM
-#   - Counter resets to 0 IMMEDIATELY when EAR >= threshold (eye opens)
+#   - Normal blink: EAR < 0.14 for only 0.1-0.4s -> NO alarm
+#   - Microsleep:   EAR < 0.14 for >= 0.67s      -> ALARM
+#   - Start time resets to None IMMEDIATELY when EAR >= threshold (eye opens)
 #   - This eliminates false alarms from normal blinking.
-EYE_AR_SEVERE_THRESH = 0.16          # Below this = eyes closed (blink or microsleep)
-EYE_AR_MILD_THRESH   = 0.22          # Below this = eyes drooping (kept for mild warning)
-EYE_SEVERE_CONSEC_FRAMES = 20        # ~0.67s at 30fps  -> microsleep confirmed
-EYE_CONSEC_FRAMES        = 48        # ~1.6s at 30fps   -> persistent drooping
+EYE_AR_SEVERE_THRESH = 0.14          # Below this = eyes closed (blink or microsleep)
+EYE_AR_MILD_THRESH   = 0.16          # Below this = eyes drooping (kept for mild warning)
+EYE_SEVERE_TIME_THRESH = 0.67        # seconds
+EYE_MILD_TIME_THRESH   = 1.60        # seconds
 
 # --- Mouth (MAR) ---
 MOUTH_AR_MILD_THRESH = 0.55
 MOUTH_AR_SEVERE_THRESH = 0.75
-MOUTH_CONSEC_FRAMES = 20
-MOUTH_SEVERE_CONSEC_FRAMES = 10
+MOUTH_MILD_TIME_THRESH = 0.67        # seconds
+MOUTH_SEVERE_TIME_THRESH = 0.33      # seconds
 
 # --- Head Pitch (chin-to-chest angle) ---
 # Research-based zones (positive = looking down, negative depends on solvePnP convention):
@@ -214,9 +229,8 @@ MOUTH_SEVERE_CONSEC_FRAMES = 10
 #   15° – 20° down: DISTRACTED – looking at phone/screen
 #   > 20° down    : DANGER    – neck muscle loss, characteristic of microsleep
 #
-# Alarm rule: pitch must stay in DANGER zone for 2-3 seconds continuously
-#             (~60-90 frames at 30fps) before triggering, to avoid false alarms
-#             from momentarily dropping something and looking down to pick it up.
+# Alarm rule: pitch must stay in DANGER zone for 2.5 seconds continuously
+#             before triggering, to avoid false alarms.
 #
 # Note: cv2.decomposeProjectionMatrix pitch sign: negative = head down in this setup
 HEAD_PITCH_SAFE_THRESH     = -15     # 0° to 15° down  -> safe zone
@@ -224,33 +238,37 @@ HEAD_PITCH_DISTRACT_THRESH = -20     # 15° to 20° down -> distracted zone
 HEAD_PITCH_DANGER_THRESH   = -20     # alias for clarity: > 20° down = danger
 HEAD_PITCH_MILD_THRESH     = -15     # kept for backward-compat (safe boundary)
 HEAD_PITCH_SEVERE_THRESH   = -20     # severe = danger zone (> 20° head-down)
-HEAD_CONSEC_FRAMES         = 30      # ~1.0s  -> persistent mild pitch
-HEAD_SEVERE_CONSEC_FRAMES  = 75      # ~2.5s  -> danger pitch confirmed (2-3s rule)
+HEAD_PITCH_MILD_TIME_THRESH   = 1.0   # seconds
+HEAD_PITCH_SEVERE_TIME_THRESH = 2.5   # seconds
 
 # --- Head Roll ---
 HEAD_ROLL_MILD_THRESH  = 20
 HEAD_ROLL_SEVERE_THRESH = 35
+HEAD_ROLL_MILD_TIME_THRESH   = 1.0   # seconds
+HEAD_ROLL_SEVERE_TIME_THRESH = 2.5   # seconds
 
-NO_FACE_CONSEC_FRAMES = 50
+# --- No Face ---
+NO_FACE_TIME_THRESH = 1.67           # seconds
 
 
 # ============================
-# STATE VARIABLES
+# STATE VARIABLES (Time-based tracking)
 # ============================
 
-# Eye counters – strict reset on eye-open (blink vs microsleep discrimination)
-eye_severe_counter = 0   # frames where EAR < EYE_AR_SEVERE_THRESH (potential microsleep)
-eye_mild_counter   = 0   # frames where EAR < EYE_AR_MILD_THRESH   (drooping)
+# Start timestamps for each event (None when event is not occurring)
+eye_severe_start_time = None
+eye_mild_start_time   = None
 
-mouth_mild_counter   = 0
-mouth_severe_counter = 0
+mouth_severe_start_time = None
+mouth_mild_start_time   = None
 
-head_pitch_mild_counter   = 0
-head_pitch_severe_counter = 0  # frames in DANGER zone (>20° head-down)
-head_roll_mild_counter    = 0
-head_roll_severe_counter  = 0
+head_pitch_severe_start_time = None
+head_pitch_mild_start_time   = None
 
-no_face_counter = 0
+head_roll_severe_start_time = None
+head_roll_mild_start_time   = None
+
+no_face_start_time = None
 ALARM_ON = False
 
 eye_mild_alert         = False
@@ -258,7 +276,7 @@ eye_severe_alert       = False   # True = microsleep detected
 mouth_mild_alert       = False
 mouth_severe_alert     = False
 head_pitch_mild_alert  = False
-head_pitch_severe_alert = False  # True = prolonged head-down (2-3s)
+head_pitch_severe_alert = False  # True = prolonged head-down
 head_roll_mild_alert   = False
 head_roll_severe_alert = False
 no_face_alert          = False
@@ -334,18 +352,22 @@ while cap.isOpened():
     # NO FACE DETECTED
     # ============================
     if not face_detected:
-        no_face_counter += 1
+        if no_face_start_time is None:
+            no_face_start_time = time.time()
 
         eye_mild_alert = eye_severe_alert = False
         mouth_mild_alert = mouth_severe_alert = False
         head_pitch_mild_alert = head_pitch_severe_alert = False
         head_roll_mild_alert = head_roll_severe_alert = False
-        eye_mild_counter = eye_severe_counter = 0
-        mouth_mild_counter = mouth_severe_counter = 0
-        head_pitch_mild_counter = head_pitch_severe_counter = 0
-        head_roll_mild_counter = head_roll_severe_counter = 0
+        
+        eye_severe_start_time = eye_mild_start_time = None
+        mouth_severe_start_time = mouth_mild_start_time = None
+        head_pitch_severe_start_time = head_pitch_mild_start_time = None
+        head_roll_severe_start_time = head_roll_mild_start_time = None
 
-        if no_face_counter >= NO_FACE_CONSEC_FRAMES:
+        elapsed_no_face = time.time() - no_face_start_time
+
+        if elapsed_no_face >= NO_FACE_TIME_THRESH:
             no_face_alert = True
             if not ALARM_ON:
                 ALARM_ON = True
@@ -365,7 +387,7 @@ while cap.isOpened():
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, frame_h - 50), (280, frame_h), (40, 40, 40), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-        cv2.putText(frame, "No face: {} / {}".format(no_face_counter, NO_FACE_CONSEC_FRAMES),
+        cv2.putText(frame, "No face: {:.2f}s / {:.2f}s".format(elapsed_no_face, NO_FACE_TIME_THRESH),
                     (10, frame_h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
 
         cv2.imshow("Drowsiness Detection (MediaPipe)", frame)
@@ -375,7 +397,7 @@ while cap.isOpened():
         continue
 
     # Face found -> reset
-    no_face_counter = 0
+    no_face_start_time = None
     no_face_alert = False
 
     for face_lm in results.face_landmarks:
@@ -410,80 +432,100 @@ while cap.isOpened():
             cv2.circle(frame, (px, py), 3, (0, 0, 255), -1)
 
         # ============================
-        # UPDATE COUNTERS & ALERTS
+        # UPDATE START TIMES & ALERTS
         # ============================
 
         # --- Eyes (Blink vs Microsleep discrimination) ---
-        # KEY LOGIC: Counter resets to 0 IMMEDIATELY when eye opens (EAR >= threshold).
-        # This suppresses false alarms from normal blinks (3-12 frames, <0.4s).
-        # Only sustained closure >= 20 frames (~0.67s) triggers microsleep alert.
+        # KEY LOGIC: Start time resets to None IMMEDIATELY when eye opens (EAR >= threshold).
+        # This suppresses false alarms from normal blinks (<0.4s).
+        # Only sustained closure >= EYE_SEVERE_TIME_THRESH (0.67s) triggers microsleep alert.
         if ear < EYE_AR_SEVERE_THRESH:
-            # Eyes fully closed -> increment both counters (could still be a blink)
-            eye_severe_counter += 1
-            eye_mild_counter += 1
+            # Eyes fully closed -> record start times
+            if eye_severe_start_time is None:
+                eye_severe_start_time = time.time()
+            if eye_mild_start_time is None:
+                eye_mild_start_time = time.time()
         elif ear < EYE_AR_MILD_THRESH:
             # Eyes drooping (half-open) -> mild only, reset severe immediately
-            eye_mild_counter += 1
-            eye_severe_counter = 0   # <-- IMMEDIATE reset: not a microsleep
+            if eye_mild_start_time is None:
+                eye_mild_start_time = time.time()
+            eye_severe_start_time = None   # <-- IMMEDIATE reset: not a microsleep
         else:
-            # Eyes open -> reset BOTH counters immediately
-            eye_mild_counter = 0
-            eye_severe_counter = 0   # <-- IMMEDIATE reset: suppresses blink false alarms
+            # Eyes open -> reset BOTH immediately
+            eye_mild_start_time = None
+            eye_severe_start_time = None   # <-- IMMEDIATE reset: suppresses blink false alarms
 
-        # Microsleep = eyes shut for >= EYE_SEVERE_CONSEC_FRAMES consecutively
-        eye_severe_alert = (eye_severe_counter >= EYE_SEVERE_CONSEC_FRAMES)
-        eye_mild_alert   = (eye_mild_counter   >= EYE_CONSEC_FRAMES)
+        # Calculate elapsed times
+        elapsed_eye_severe = time.time() - eye_severe_start_time if eye_severe_start_time is not None else 0.0
+        elapsed_eye_mild   = time.time() - eye_mild_start_time if eye_mild_start_time is not None else 0.0
+
+        eye_severe_alert = (elapsed_eye_severe >= EYE_SEVERE_TIME_THRESH)
+        eye_mild_alert   = (elapsed_eye_mild >= EYE_MILD_TIME_THRESH)
 
         # --- Mouth ---
         if mar > MOUTH_AR_SEVERE_THRESH:
-            mouth_severe_counter += 1
-            mouth_mild_counter += 1
+            if mouth_severe_start_time is None:
+                mouth_severe_start_time = time.time()
+            if mouth_mild_start_time is None:
+                mouth_mild_start_time = time.time()
         elif mar > MOUTH_AR_MILD_THRESH:
-            mouth_mild_counter += 1
-            mouth_severe_counter = 0
+            if mouth_mild_start_time is None:
+                mouth_mild_start_time = time.time()
+            mouth_severe_start_time = None
         else:
-            mouth_mild_counter = 0
-            mouth_severe_counter = 0
+            mouth_mild_start_time = None
+            mouth_severe_start_time = None
 
-        mouth_severe_alert = (mouth_severe_counter >= MOUTH_SEVERE_CONSEC_FRAMES)
-        mouth_mild_alert   = (mouth_mild_counter   >= MOUTH_CONSEC_FRAMES)
+        elapsed_mouth_severe = time.time() - mouth_severe_start_time if mouth_severe_start_time is not None else 0.0
+        elapsed_mouth_mild   = time.time() - mouth_mild_start_time if mouth_mild_start_time is not None else 0.0
+
+        mouth_severe_alert = (elapsed_mouth_severe >= MOUTH_SEVERE_TIME_THRESH)
+        mouth_mild_alert   = (elapsed_mouth_mild >= MOUTH_MILD_TIME_THRESH)
 
         # --- Head Pitch (chin-to-chest / head nodding) ---
         # Zone classification (negative pitch = head bowing down in solvePnP convention):
         #   pitch > -15°            -> SAFE zone        (normal driving glance)
         #   -20° < pitch <= -15°    -> DISTRACTED zone  (phone / infotainment)
         #   pitch <= -20°           -> DANGER zone      (microsleep posture)
-        #
-        # Alarm: DANGER zone must persist 2-3 seconds (~75 frames) to avoid
-        # false positives from momentarily dropping something and looking down.
         if pitch < HEAD_PITCH_SEVERE_THRESH:      # <=> pitch <= -20° -> DANGER
-            head_pitch_severe_counter += 1
-            head_pitch_mild_counter += 1
+            if head_pitch_severe_start_time is None:
+                head_pitch_severe_start_time = time.time()
+            if head_pitch_mild_start_time is None:
+                head_pitch_mild_start_time = time.time()
         elif pitch < HEAD_PITCH_MILD_THRESH:      # <=> -20° < pitch <= -15° -> DISTRACTED
-            head_pitch_mild_counter += 1
-            head_pitch_severe_counter = 0         # left DANGER zone -> reset danger counter
+            if head_pitch_mild_start_time is None:
+                head_pitch_mild_start_time = time.time()
+            head_pitch_severe_start_time = None   # left DANGER zone -> reset danger start time
         else:                                     # > -15° -> SAFE -> reset all
-            head_pitch_mild_counter = 0
-            head_pitch_severe_counter = 0
+            head_pitch_mild_start_time = None
+            head_pitch_severe_start_time = None
 
-        # Severe pitch alert requires ~2.5s of continuous DANGER zone (HEAD_SEVERE_CONSEC_FRAMES=75)
-        head_pitch_severe_alert = (head_pitch_severe_counter >= HEAD_SEVERE_CONSEC_FRAMES)
-        head_pitch_mild_alert   = (head_pitch_mild_counter   >= HEAD_CONSEC_FRAMES)
+        elapsed_pitch_severe = time.time() - head_pitch_severe_start_time if head_pitch_severe_start_time is not None else 0.0
+        elapsed_pitch_mild   = time.time() - head_pitch_mild_start_time if head_pitch_mild_start_time is not None else 0.0
+
+        head_pitch_severe_alert = (elapsed_pitch_severe >= HEAD_PITCH_SEVERE_TIME_THRESH)
+        head_pitch_mild_alert   = (elapsed_pitch_mild >= HEAD_PITCH_MILD_TIME_THRESH)
 
         # --- Head roll ---
         abs_roll = abs(roll)
         if abs_roll > HEAD_ROLL_SEVERE_THRESH:
-            head_roll_severe_counter += 1
-            head_roll_mild_counter += 1
+            if head_roll_severe_start_time is None:
+                head_roll_severe_start_time = time.time()
+            if head_roll_mild_start_time is None:
+                head_roll_mild_start_time = time.time()
         elif abs_roll > HEAD_ROLL_MILD_THRESH:
-            head_roll_mild_counter += 1
-            head_roll_severe_counter = 0
+            if head_roll_mild_start_time is None:
+                head_roll_mild_start_time = time.time()
+            head_roll_severe_start_time = None
         else:
-            head_roll_mild_counter = 0
-            head_roll_severe_counter = 0
+            head_roll_mild_start_time = None
+            head_roll_severe_start_time = None
 
-        head_roll_severe_alert = (head_roll_severe_counter >= HEAD_SEVERE_CONSEC_FRAMES)
-        head_roll_mild_alert   = (head_roll_mild_counter   >= HEAD_CONSEC_FRAMES)
+        elapsed_roll_severe = time.time() - head_roll_severe_start_time if head_roll_severe_start_time is not None else 0.0
+        elapsed_roll_mild   = time.time() - head_roll_mild_start_time if head_roll_mild_start_time is not None else 0.0
+
+        head_roll_severe_alert = (elapsed_roll_severe >= HEAD_ROLL_SEVERE_TIME_THRESH)
+        head_roll_mild_alert   = (elapsed_roll_mild >= HEAD_ROLL_MILD_TIME_THRESH)
 
         # ============================
         # ALARM DECISION LOGIC
@@ -532,7 +574,7 @@ while cap.isOpened():
             alert_y += 28
 
         if eye_severe_alert:
-            cv2.putText(frame, "[MICROSLEEP] EYES SHUT >{:.0f}f".format(EYE_SEVERE_CONSEC_FRAMES),
+            cv2.putText(frame, "[MICROSLEEP] EYES SHUT >{:.2f}s".format(EYE_SEVERE_TIME_THRESH),
                         (10, alert_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             alert_y += 25
         elif eye_mild_alert:
@@ -599,13 +641,17 @@ while cap.isOpened():
         pitch_c = get_color(pitch, HEAD_PITCH_MILD_THRESH, HEAD_PITCH_SEVERE_THRESH, True)
         roll_c = get_color(abs_roll, HEAD_ROLL_MILD_THRESH, HEAD_ROLL_SEVERE_THRESH, False)
 
-        cv2.putText(frame, "EAR:   {:.2f}  (blink<{:.2f} / microsleep>={:.0f}f)".format(
-            ear, EYE_AR_SEVERE_THRESH, EYE_SEVERE_CONSEC_FRAMES),
+        cv2.putText(frame, "EAR:   {:.2f}  (blink<{:.2f} / microsleep>={:.2f}s)".format(
+            ear, EYE_AR_SEVERE_THRESH, EYE_SEVERE_TIME_THRESH),
             (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ear_c, 1)
 
-        cv2.putText(frame, "EAR cnt: {:3d}/{:d}  MAR: {:.2f} (>{:.2f})".format(
-            eye_severe_counter, EYE_SEVERE_CONSEC_FRAMES, mar, MOUTH_AR_MILD_THRESH),
-            (10, info_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mar_c, 1)
+        cv2.putText(frame, "EAR dur: {:.2f}s/{:.2f}s".format(
+            elapsed_eye_severe, EYE_SEVERE_TIME_THRESH),
+            (10, info_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ear_c, 1)
+
+        cv2.putText(frame, "MAR: {:.2f} (>{:.2f})".format(
+            mar, MOUTH_AR_MILD_THRESH),
+            (180, info_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mar_c, 1)
 
         # Pitch zone label
         if pitch > HEAD_PITCH_MILD_THRESH:
@@ -614,8 +660,8 @@ while cap.isOpened():
             pitch_zone = "DISTRACTED"
         else:
             pitch_zone = "DANGER"
-        cv2.putText(frame, "Pitch: {:.1f} [{:s}] cnt:{:d}/{:d}".format(
-            pitch, pitch_zone, head_pitch_severe_counter, HEAD_SEVERE_CONSEC_FRAMES),
+        cv2.putText(frame, "Pitch: {:.1f} [{:s}] dur:{:.2f}s/{:.2f}s".format(
+            pitch, pitch_zone, elapsed_pitch_severe, HEAD_PITCH_SEVERE_TIME_THRESH),
             (10, info_y + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45, pitch_c, 1)
 
         cv2.putText(frame, "Roll:  {:.1f}  (mild:+/-{:.0f} sev:+/-{:.0f})".format(
@@ -636,7 +682,8 @@ while cap.isOpened():
         cv2.putText(frame, combo_text,
                     (10, info_y + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.45, combo_color, 1)
 
-        cv2.putText(frame, "No-face: {} / {}".format(no_face_counter, NO_FACE_CONSEC_FRAMES),
+        cv2.putText(frame, "No-face: {:.2f}s / {:.2f}s".format(
+            0.0 if no_face_start_time is None else (time.time() - no_face_start_time), NO_FACE_TIME_THRESH),
                     (10, info_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
         # ============================
